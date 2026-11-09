@@ -515,6 +515,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     } else if (gdn_state_rows) {
         state = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
         cb(state, "state_cache_view", il);
+    } else if (inp->state_inplace && cparams.n_rs_seq == 0 && (n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch)) {
+        // 原地状态：单序列且源行就是自身，GDN 直接读写缓存行，省掉 gather 与回写拷贝
+        ggml_tensor * states = ggml_reshape_2d(ctx0, ssm_states_all, hparams.n_embd_s(), ssm_states_all->ne[1]);
+        const int32_t rs_zero = inp->rs_z;
+        // 与 build_rs 相同：先清零新序列的状态行（rs_zero < 0 时为空视图）
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, hparams.n_embd_s()*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+        state = ggml_view_4d(ctx0, ssm_states_all, head_v_dim, head_v_dim, num_v_heads, 1,
+                ggml_row_size(ssm_states_all->type, head_v_dim),
+                ggml_row_size(ssm_states_all->type, head_v_dim * head_v_dim),
+                ssm_states_all->nb[1],
+                (size_t) inp->head * ssm_states_all->nb[1]);
+        cb(state, "state_inplace", il);
     } else {
         state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
         state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);

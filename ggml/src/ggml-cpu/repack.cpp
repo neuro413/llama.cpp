@@ -5250,12 +5250,21 @@ class ptq1_0_avx2_traits : public tensor_traits_base {
   private:
     static size_t act_row_size(int64_t k) { return (size_t) k + 8 * (size_t) (k / QK); }
 
-    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
+    // 列数较多（提示处理）时走“先解码再乘”路径：把一小块权重行解成 t = w+1 的 int8 放在 L2，
+    // 解码开销由所有列分摊，内层循环只剩 maddubs + 累加，port 1/5 的压力大幅下降
+    static constexpr int64_t DEC_MIN_COLS = 16;          // 列数达到此值才使用
+    static constexpr size_t  DEC_BUF      = 128 * 1024;  // 每线程解码缓冲（留在 L2）
+    static constexpr int64_t DEC_SLICE    = 40;          // k 方向每片最多块数：4 列激活约 20KB，留在 L1
+
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
         if (op->op != GGML_OP_MUL_MAT) {
             return false;
         }
         const int64_t k = op->src[0]->ne[0];
         size = act_row_size(k) * (size_t) (ggml_nrows(op->src[1])) + 64;
+        if (ggml_nrows(op->src[1]) >= DEC_MIN_COLS) {
+            size += (size_t) n_threads * (DEC_BUF + 64);
+        }
         return true;
     }
 
@@ -5282,14 +5291,15 @@ class ptq1_0_avx2_traits : public tensor_traits_base {
     }
 
     // 一行激活: 每 128 个一组 int8 量化，输出 [q: k 字节][d: k/128 个 float][ds: k/128 个 float，等于 d * sum(q)]
-    static void quantize_act(const float * x, char * dst, int64_t k) {
+    // 只处理块区间 [b0, b1)，便于单列时多线程分担
+    static void quantize_act(const float * x, char * dst, int64_t k, int64_t b0, int64_t b1) {
         const int64_t nb = k / QK;
         int8_t * q  = (int8_t *) dst;
         float *  d  = (float *) (dst + k);
         float *  ds = (float *) (dst + k + 4 * nb);
         const __m256  sign = _mm256_set1_ps(-0.0f);
         const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-        for (int64_t b = 0; b < nb; ++b) {
+        for (int64_t b = b0; b < b1; ++b) {
             const float * xb = x + b * QK;
             __m256 mx = _mm256_setzero_ps();
             for (int i = 0; i < QK / 8; ++i) {
@@ -5379,6 +5389,14 @@ class ptq1_0_avx2_traits : public tensor_traits_base {
             }
 #endif
             __m256i x = _mm256_setzero_si256();
+            // 每列独立指针 + 立即数偏移寻址：[base+index] 形式的三操作数 VEX 指令在 Haswell 上会被拆成 2 个 uop
+            const int8_t * ap[NC];
+            for (int j = 0; j < NC; ++j) {
+                ap[j] = yq[j] + off;
+#if defined(__clang__) || defined(__GNUC__)
+                __asm__("" : "+r"(ap[j]));
+#endif
+            }
 #if defined(__clang__)
 #pragma clang loop unroll(full)
 #endif
@@ -5386,7 +5404,7 @@ class ptq1_0_avx2_traits : public tensor_traits_base {
                 x = (c % 5 == 0) ? _mm256_loadu_si256((const __m256i *) (q + 32 * (c / 5))) : mul3(x);
                 const __m256i t = trit(x);
                 for (int j = 0; j < NC; ++j) {
-                    const __m256i p = _mm256_maddubs_epi16(t, _mm256_loadu_si256((const __m256i *) (yq[j] + off + 32 * c)));
+                    const __m256i p = _mm256_maddubs_epi16(t, _mm256_loadu_si256((const __m256i *) (ap[j] + 32 * c)));
                     a16[j] = (c % 4 == 0) ? p : _mm256_add_epi16(a16[j], p);
                 }
                 if (c % 4 == 3) {
@@ -5439,6 +5457,175 @@ class ptq1_0_avx2_traits : public tensor_traits_base {
         }
     }
 
+    // 行区间 [rb0, rb1) × NC 列，结果写入 dp[j][r]
+    template <int NC>
+    static void dot_rows(int64_t k, const uint8_t * w0, size_t rs, int64_t rb0, int64_t rb1, const char * const * act,
+                         float * const * dp) {
+        for (int64_t r = rb0; r < rb1; ++r) {
+            float res[NC];
+            dot_row<NC>(k, w0 + r * rs, act, res);
+            for (int j = 0; j < NC; ++j) {
+                dp[j][r] = res[j];
+            }
+        }
+    }
+
+    // 把 nrows 行重排权重解码为 t = w+1 (0..2)，按自然顺序存放，每行 k 字节
+    static void decode_rows(int64_t k, const uint8_t * w, size_t rs, int64_t nrows, uint8_t * T) {
+        const int64_t nb = k / QK;
+        const int64_t ng = nb / GB;
+        const int64_t nr = nb % GB;
+        const __m256i c_lo = _mm256_set1_epi8(-43);
+        const __m256i c_hi = _mm256_set1_epi8(42);
+        const __m256i one8 = _mm256_set1_epi8(1);
+        auto trit = [&](__m256i x) {
+            return _mm256_sub_epi8(_mm256_and_si256(_mm256_cmpgt_epi8(x, c_lo), one8), _mm256_cmpgt_epi8(x, c_hi));
+        };
+        auto mul3 = [](__m256i x) {
+            x = _mm256_add_epi8(x, _mm256_add_epi8(x, x));
+#if defined(__clang__) || defined(__GNUC__)
+            __asm__("" : "+x"(x));
+#endif
+            return x;
+        };
+        for (int64_t r = 0; r < nrows; ++r) {
+            const uint8_t * wr = w + r * rs;
+            uint8_t *       t  = T + r * k;
+            for (int64_t g = 0; g < ng; ++g) {
+                for (int v = 0; v < 4; ++v) {
+                    __m256i x = _mm256_loadu_si256((const __m256i *) (wr + 128 * g + 32 * v));
+                    for (int p = 0; p < 5; ++p) {
+                        if (p > 0) {
+                            x = mul3(x);
+                        }
+                        _mm256_store_si256((__m256i *) (t + 640 * g + 32 * (5 * v + p)), trit(x));
+                    }
+                }
+            }
+            for (int64_t rb = 0; rb < nr; ++rb) {
+                __m256i x = _mm256_loadu_si256((const __m256i *) (wr + 128 * ng + 32 * rb));
+                for (int p = 0; p < 4; ++p) {
+                    if (p > 0) {
+                        x = mul3(x);
+                    }
+                    _mm256_store_si256((__m256i *) (t + 640 * ng + 128 * rb + 32 * p), trit(x));
+                }
+            }
+        }
+    }
+
+    // 一行预解码权重与 NC 列激活在块区间 [b0, b1) 上的部分点积（含偏移校正）。
+    // first 时写入 out[j][r]，否则累加
+    template <int NC>
+    static void dot_dec(const uint8_t * T, const uint16_t * sc, const int8_t * const * yq, const float * const * yd,
+                        const float * const * ys, int64_t b0, int64_t b1, float * const * out, int64_t r, bool first) {
+        const __m256i ones = _mm256_set1_epi16(1);
+        __m256        acc[NC];
+        __m256i       a16[NC];
+        alignas(32) float fb[NC][8];
+        for (int j = 0; j < NC; ++j) {
+            acc[j] = _mm256_setzero_ps();
+        }
+        const uint8_t * tp = T + 128 * b0;
+        const int8_t *  ap[NC];
+        for (int j = 0; j < NC; ++j) {
+            ap[j] = yq[j] + 128 * b0;
+        }
+        // 一个 128 元素块：4 次 (t 加载 + NC 次 maddubs)，再转 fp32 乘缩放累加
+        auto block = [&](const float * f, int stride) {
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#endif
+            for (int c = 0; c < 4; ++c) {
+                const __m256i t = _mm256_load_si256((const __m256i *) (tp + 32 * c));
+                for (int j = 0; j < NC; ++j) {
+                    const __m256i p = _mm256_maddubs_epi16(t, _mm256_loadu_si256((const __m256i *) (ap[j] + 32 * c)));
+                    a16[j] = c == 0 ? p : _mm256_add_epi16(a16[j], p);
+                }
+            }
+            for (int j = 0; j < NC; ++j) {
+                acc[j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(a16[j], ones)), _mm256_broadcast_ss(f + j * stride), acc[j]);
+            }
+            // 每块推进一次指针：偏移保持在 disp8 范围内，并避免 [base+index] 寻址
+            tp += 128;
+#if defined(__clang__) || defined(__GNUC__)
+            __asm__("" : "+r"(tp));
+#endif
+            for (int j = 0; j < NC; ++j) {
+                ap[j] += 128;
+#if defined(__clang__) || defined(__GNUC__)
+                __asm__("" : "+r"(ap[j]));
+#endif
+            }
+        };
+        int64_t b = b0;
+        for (; b + 8 <= b1; b += 8) {
+            const __m256 dx = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (sc + b)));
+            for (int j = 0; j < NC; ++j) {
+                _mm256_store_ps(fb[j], _mm256_mul_ps(dx, _mm256_loadu_ps(yd[j] + b)));
+            }
+#if defined(__clang__) || defined(__GNUC__)
+            __asm__ volatile("" : : "r"(&fb[0][0]) : "memory");
+#endif
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#endif
+            for (int bb = 0; bb < 8; ++bb) {
+                block(&fb[0][bb], 8);
+            }
+        }
+        for (; b < b1; ++b) {
+            const float dx = GGML_CPU_FP16_TO_FP32(sc[b]);
+            float       f[NC];
+            for (int j = 0; j < NC; ++j) {
+                f[j] = dx * yd[j][b];
+            }
+            block(f, 1);
+        }
+        // 偏移校正: sum_b dx_b * ds_b
+        __m256 cv[NC];
+        for (int j = 0; j < NC; ++j) {
+            cv[j] = _mm256_setzero_ps();
+        }
+        b = b0;
+        for (; b + 8 <= b1; b += 8) {
+            const __m256 dx = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (sc + b)));
+            for (int j = 0; j < NC; ++j) {
+                cv[j] = _mm256_fmadd_ps(dx, _mm256_loadu_ps(ys[j] + b), cv[j]);
+            }
+        }
+        for (int j = 0; j < NC; ++j) {
+            float s = hsum_ps(_mm256_sub_ps(acc[j], cv[j]));
+            for (int64_t bb = b; bb < b1; ++bb) {
+                s -= GGML_CPU_FP16_TO_FP32(sc[bb]) * ys[j][bb];
+            }
+            out[j][r] = first ? s : out[j][r] + s;
+        }
+    }
+
+    // nrows 行已解码权重（T）× NC 列；k 方向切片，让 NC 列激活的当前片留在 L1
+    template <int NC>
+    static void gemm_dec(int64_t k, const uint8_t * T, const uint16_t * const * scs, int64_t nrows, const char * const * act,
+                         float * const * dp, int64_t r0) {
+        const int64_t  nb = k / QK;
+        const int8_t * yq[NC];
+        const float *  yd[NC];
+        const float *  ys[NC];
+        for (int j = 0; j < NC; ++j) {
+            yq[j] = (const int8_t *) act[j];
+            yd[j] = (const float *) (act[j] + k);
+            ys[j] = (const float *) (act[j] + k + 4 * nb);
+        }
+        const int64_t nsl = (nb + DEC_SLICE - 1) / DEC_SLICE;
+        const int64_t sl  = ((nb + nsl - 1) / nsl + 7) & ~(int64_t) 7;
+        for (int64_t b0 = 0; b0 < nb; b0 += sl) {
+            const int64_t b1 = MIN(b0 + sl, nb);
+            for (int64_t r = 0; r < nrows; ++r) {
+                dot_dec<NC>(T + r * k, scs[r], yq, yd, ys, b0, b1, dp, r0 + r, b0 == 0);
+            }
+        }
+    }
+
     void forward_mul_mat(ggml_compute_params * params, ggml_tensor * op) {
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
@@ -5459,17 +5646,41 @@ class ptq1_0_avx2_traits : public tensor_traits_base {
         const int64_t ncols = ne11 * ne12 * ne13;
         char *        wdata = (char *) params->wdata;
 
-        for (int64_t c = ith; c < ncols; c += nth) {
-            const int64_t i13 = c / (ne11 * ne12);
-            const int64_t i12 = (c / ne11) % ne12;
-            const int64_t i11 = c % ne11;
-            quantize_act((const float *) ((const char *) src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13), wdata + c * arow, k);
+        // 激活量化：把 (列, 块) 展平后按连续区间均分给所有线程。
+        // 单列（生成阶段）时也能多线程分担，其余线程不必在下面的 barrier 前空等线程 0
+        {
+            const int64_t nbq = k / QK;
+            const int64_t U   = ncols * nbq;
+            const int64_t u1  = U * (ith + 1) / nth;
+            for (int64_t u = U * ith / nth; u < u1;) {
+                const int64_t c   = u / nbq;
+                const int64_t b0  = u % nbq;
+                const int64_t b1  = MIN(nbq, b0 + (u1 - u));
+                const int64_t i13 = c / (ne11 * ne12);
+                const int64_t i12 = (c / ne11) % ne12;
+                const int64_t i11 = c % ne11;
+                quantize_act((const float *) ((const char *) src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13), wdata + c * arow, k, b0, b1);
+                u += b1 - b0;
+            }
         }
 
-        // 行切块，动态分配给线程
-        const int64_t nr0      = ne01;
-        const int64_t chunk    = MAX(16, (nr0 + 8 * nth - 1) / (8 * nth));
-        const int64_t nchunk   = (nr0 + chunk - 1) / chunk;
+        // 行切块，动态分配给线程：前 3/4 的行用大块（每线程约 3 块），
+        // 剩下 1/4 用约 128KB 权重的小块，让各线程几乎同时结束，减少最后的空等
+        const int64_t nr0    = ne01;
+        const int64_t cs     = MIN(nr0, MAX((int64_t) 16, (int64_t) (128 * 1024) / (int64_t) nb01));
+        const int64_t cb     = MAX(cs, nr0 / (4 * nth));
+        const int64_t nbig   = (nr0 - nr0 / 4) / cb;
+        const int64_t rbig   = nbig * cb;
+        const int64_t nchunk = nbig + (nr0 - rbig + cs - 1) / cs;
+        auto chunk_rows = [&](int64_t idx, int64_t & r0, int64_t & r1) {
+            if (idx < nbig) {
+                r0 = idx * cb;
+                r1 = r0 + cb;
+            } else {
+                r0 = rbig + (idx - nbig) * cs;
+                r1 = MIN(r0 + cs, nr0);
+            }
+        };
 
         if (ith == 0) {
             ggml_threadpool_chunk_set(params->threadpool, nth);
@@ -5483,33 +5694,77 @@ class ptq1_0_avx2_traits : public tensor_traits_base {
             return (char *) dst->data + i11 * nb1 + i12 * nb2 + i13 * nb3;
         };
 
+        if (ncols >= DEC_MIN_COLS) {
+            // 解码路径：每次解码 R 行到线程私有缓冲 T，再与所有列相乘
+            const int64_t    nb    = k / QK;
+            const size_t     scoff = 128 * (size_t) (nb / GB) + 32 * (size_t) (nb % GB);
+            uint8_t *        T     = (uint8_t *) GGML_PAD((uintptr_t) (wdata + ncols * arow) + (size_t) ith * (DEC_BUF + 64), 64);
+            const int64_t    R     = MAX(1, (int64_t) DEC_BUF / k);
+            const uint16_t * scs[DEC_BUF / 256];
+            int current = ith;
+            while (current < nchunk) {
+                int64_t r0, r1;
+                chunk_rows(current, r0, r1);
+                for (int64_t rb0 = r0; rb0 < r1; rb0 += R) {
+                    const int64_t   nr = MIN(R, r1 - rb0);
+                    const uint8_t * wb = (const uint8_t *) src0->data + rb0 * nb01;
+                    decode_rows(k, wb, nb01, nr, T);
+                    for (int64_t r = 0; r < nr; ++r) {
+                        scs[r] = (const uint16_t *) (wb + r * nb01 + scoff);
+                    }
+                    int64_t c = 0;
+                    for (; c + 4 <= ncols; c += 4) {
+                        const char * act[4] = { wdata + (c + 0) * arow, wdata + (c + 1) * arow, wdata + (c + 2) * arow, wdata + (c + 3) * arow };
+                        float * dp[4] = { (float *) dst_ptr(c + 0), (float *) dst_ptr(c + 1), (float *) dst_ptr(c + 2), (float *) dst_ptr(c + 3) };
+                        gemm_dec<4>(k, T, scs, nr, act, dp, rb0);
+                    }
+                    // 剩余 1–3 列一次做完，T 只再读一遍
+                    const char * act[3];
+                    float *      dp[3];
+                    for (int64_t j = c; j < ncols; ++j) {
+                        act[j - c] = wdata + j * arow;
+                        dp[j - c]  = (float *) dst_ptr(j);
+                    }
+                    switch (ncols - c) {
+                        case 3: gemm_dec<3>(k, T, scs, nr, act, dp, rb0); break;
+                        case 2: gemm_dec<2>(k, T, scs, nr, act, dp, rb0); break;
+                        case 1: gemm_dec<1>(k, T, scs, nr, act, dp, rb0); break;
+                        default: break;
+                    }
+                }
+                current = ggml_threadpool_chunk_add(params->threadpool, 1);
+            }
+            return;
+        }
+
         int current = ith;
         while (current < nchunk) {
-            const int64_t r0 = current * chunk;
-            const int64_t r1 = MIN(r0 + chunk, nr0);
+            int64_t r0, r1;
+            chunk_rows(current, r0, r1);
 
             // 行再切成约 64KB 的小块，让权重在遍历所有列期间留在 L2
             const int64_t rblk = ncols > 1 ? MAX(4, (int64_t) (64 * 1024) / (int64_t) nb01) : r1 - r0;
             for (int64_t rb0 = r0; rb0 < r1; rb0 += rblk) {
                 const int64_t rb1 = MIN(rb0 + rblk, r1);
+                const uint8_t * w0 = (const uint8_t *) src0->data;
                 int64_t c = 0;
                 for (; c + 4 <= ncols; c += 4) {
                     const char * act[4] = { wdata + (c + 0) * arow, wdata + (c + 1) * arow, wdata + (c + 2) * arow, wdata + (c + 3) * arow };
-                    char * dp[4] = { dst_ptr(c + 0), dst_ptr(c + 1), dst_ptr(c + 2), dst_ptr(c + 3) };
-                    for (int64_t r = rb0; r < rb1; ++r) {
-                        float res[4];
-                        dot_row<4>(k, (const uint8_t *) src0->data + r * nb01, act, res);
-                        for (int j = 0; j < 4; ++j) {
-                            ((float *) dp[j])[r] = res[j];
-                        }
-                    }
+                    float * dp[4] = { (float *) dst_ptr(c + 0), (float *) dst_ptr(c + 1), (float *) dst_ptr(c + 2), (float *) dst_ptr(c + 3) };
+                    dot_rows<4>(k, w0, nb01, rb0, rb1, act, dp);
                 }
-                for (; c < ncols; ++c) {
-                    const char * act[1] = { wdata + c * arow };
-                    float * dp = (float *) dst_ptr(c);
-                    for (int64_t r = rb0; r < rb1; ++r) {
-                        dot_row<1>(k, (const uint8_t *) src0->data + r * nb01, act, dp + r);
-                    }
+                // 剩余 1–3 列一次做完：权重只再解码一遍（原来每列各解码一遍）
+                const char * act[3];
+                float *      dp[3];
+                for (int64_t j = c; j < ncols; ++j) {
+                    act[j - c] = wdata + j * arow;
+                    dp[j - c]  = (float *) dst_ptr(j);
+                }
+                switch (ncols - c) {
+                    case 3: dot_rows<3>(k, w0, nb01, rb0, rb1, act, dp); break;
+                    case 2: dot_rows<2>(k, w0, nb01, rb0, rb1, act, dp); break;
+                    case 1: dot_rows<1>(k, w0, nb01, rb0, rb1, act, dp); break;
+                    default: break;
                 }
             }
 

@@ -364,6 +364,10 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // 单状态且源行就是自身（s_copy(0) == head）：GDN 可直接在缓存行上原地读写
+    bool state_inplace = false;
+    static bool calc_state_inplace(const llama_memory_recurrent_context * mctx_cur, uint32_t n_seqs);
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

@@ -462,7 +462,19 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
-    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    ggml_tensor * conv_states;
+    if (inp->state_inplace && cparams.n_rs_seq == 0) {
+        // 单序列且源行就是自身：concat 直接读缓存行，省掉 GET_ROWS。
+        // 后面写回缓存的 cpy 依赖 concat 的结果，读一定发生在写之前
+        ggml_tensor * states = ggml_reshape_2d(ctx0, conv_states_all, hparams.n_embd_r(), conv_states_all->ne[1]);
+        const int32_t rs_zero = inp->rs_z;
+        // 与 build_rs 相同：先清零新序列的状态行（rs_zero < 0 时为空视图）
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, hparams.n_embd_r()*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+        conv_states = ggml_view_2d(ctx0, states, hparams.n_embd_r(), 1, states->nb[1], (size_t) kv_head * states->nb[1]);
+    } else {
+        conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    }
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
@@ -558,6 +570,13 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor * new_state = attn_out.second;
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
+
+        // s 是缓存行视图（qwen35 原地状态路径）且走了融合 GDN：让算子直接写回缓存，不再拷贝
+        ggml_tensor * gdn = new_state->view_src;
+        if (s->view_src == ssm_states_all && gdn && gdn->op == GGML_OP_GATED_DELTA_NET && gdn->src[5] == s) {
+            gdn->op_params[2] = 1; // 原地模式（见 ggml-cpu ops.cpp）
+            return output;
+        }
 
         ggml_build_forward_expand(gf,
                 ggml_cpy(ctx0, new_state,

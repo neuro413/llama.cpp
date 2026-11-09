@@ -446,7 +446,8 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mctx_cur, const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx_cur->get_n_rs();
 
-    if (s_copy) {
+    // 原地状态路径下 conv 与 GDN 都直接读写缓存行，图中可能没有节点用到 s_copy，此时它不会被分配
+    if (s_copy && s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
         int32_t * data = (int32_t *) s_copy->data;
 
@@ -493,8 +494,15 @@ void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mct
     }
 }
 
+bool llm_graph_input_rs::calc_state_inplace(const llama_memory_recurrent_context * mctx_cur, uint32_t n_seqs) {
+    return n_seqs == 1 && mctx_cur->get_n_rs() == 1 && !mctx_cur->get_rpl() &&
+           mctx_cur->s_copy(0) == (int32_t) mctx_cur->get_head();
+}
+
 bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mctx_cur, const llm_graph_params & params) {
     bool res = true;
+
+    res &= state_inplace == calc_state_inplace(mctx_cur, params.ubatch.n_seqs);
 
     res &= s_copy->ne[0] == mctx_cur->get_n_rs();
 
@@ -4075,6 +4083,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->state_inplace = llm_graph_input_rs::calc_state_inplace(mctx_cur, ubatch.n_seqs);
 
     return inp;
 }

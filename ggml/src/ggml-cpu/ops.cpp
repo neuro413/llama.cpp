@@ -2082,9 +2082,34 @@ static void ggml_compute_forward_concat_f32(
     const float * x;
 
     // split over flattened rows (i1, i2, i3) so a single-sequence concat
-    // (ne2 == ne3 == 1) still uses every thread
+    // (ne2 == ne3 == 1) still uses every thread.
+    // 按连续行区间分给线程：行很短时（如 conv 输入每行 4 个 float），交错分配会让多个线程写同一缓存行（伪共享）
     const int64_t nrows = ne1*ne2*ne3;
-    for (int64_t ir = ith; ir < nrows; ir += nth) {
+    const int64_t dr    = (nrows + nth - 1)/nth;
+    const int64_t ir0   = MIN(nrows, dr*ith);
+    const int64_t ir1   = MIN(nrows, ir0 + dr);
+
+    if (dim == 0 && nb00 == sizeof(float) && nb0 == sizeof(float)) {
+        // 快速路径：沿 dim 0 拼接时，每行 = src0 的一段连续数据 + src1 的 ne10 个元素
+        for (int64_t ir = ir0; ir < ir1; ir++) {
+            const int64_t i3 = ir/(ne1*ne2);
+            const int64_t i2 = (ir - i3*ne1*ne2)/ne1;
+            const int64_t i1 = ir - i3*ne1*ne2 - i2*ne1;
+            float * y = (float *)((char *)dst->data + i1*nb1 + i2*nb2 + i3*nb3);
+            memcpy(y, (const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03, ne00*sizeof(float));
+            const char * x1 = (const char *)src1->data + i1*nb11 + i2*nb12 + i3*nb13;
+            if (nb10 == sizeof(float)) {
+                memcpy(y + ne00, x1, ne10*sizeof(float));
+            } else {
+                for (int64_t i0 = 0; i0 < ne10; i0++) {
+                    y[ne00 + i0] = *(const float *)(x1 + i0*nb10);
+                }
+            }
+        }
+        return;
+    }
+
+    for (int64_t ir = ir0; ir < ir1; ir++) {
         const int64_t i3 = ir/(ne1*ne2);
         const int64_t i2 = (ir - i3*ne1*ne2)/ne1;
         const int64_t i1 = ir - i3*ne1*ne2 - i2*ne1;
@@ -11478,6 +11503,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const int64_t state_seq_stride = src_rows ? 0 : (int64_t) (src_state->nb[3] / sizeof(float));
     const int64_t state_row_size   = src_rows ? (int64_t) (src_state->nb[1] / sizeof(float)) : 0;
 
+    // 原地模式（op 参数 2）：src_state 是缓存行的视图，直接在缓存上读写，不再输出新状态（K 必须为 1）
+    const bool inplace = ggml_get_op_params_i32(dst, 2) != 0;
+    GGML_ASSERT(!inplace || (K == 1 && src_rows == nullptr));
+
     const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
     const int ith = params->ith;
 
@@ -11519,6 +11548,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         float * s_out = (K > 1)
             ? state_work
             : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        if (inplace) {
+            s_out = (float *) state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        }
 
         // copy input state into the working buffer and operate in-place.
         // scratch mode: state layout [S_v, S_v, H, n_seqs], seq iv3 starts at
@@ -11526,7 +11558,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const float * s_in = state_rows_idx
             ? state_in_base + (int64_t) state_rows_idx[iv3] * state_row_size + iv1 * S_v * S_v
             : state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        if (s_out != s_in) {
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -11554,30 +11588,29 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 for (int64_t i = 0; i < S_v; ++i) {
                     delta[i] = expf(g_d[i]);
                 }
-                // S[i][:] *= exp(g[i]) => for each row j of M: M[j][i] *= exp(g[i])
-                for (int64_t j = 0; j < S_v; ++j) {
-                    ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
+            }
+            const float eg = kda ? 0.0f : expf(g0);
+
+            // 四步（衰减、delta、外积更新、输出）对每一行 j 都只涉及该行本身，
+            // 逐行一次做完，行（S_v 个 float）留在 L1，避免把整个状态矩阵扫 4 遍。
+            // 每行仍调用相同的向量原语、顺序不变，结果与分步计算逐位一致。
+            for (int64_t j = 0; j < S_v; ++j) {
+                float * row = &s_out[j * S_v];
+                // 衰减: S[i][j] *= exp(g[i])（KDA）或整体乘 exp(g)
+                if (kda) {
+                    ggml_vec_mul_f32(S_v, row, row, delta);
+                } else {
+                    ggml_vec_scale_f32(S_v, row, eg);
                 }
-            } else {
-                ggml_vec_scale_f32(S_v * S_v, s_out, expf(g0));
-            }
-
-            // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
-            for (int64_t j = 0; j < S_v; ++j) {
+                // d_j = (v[j] - sum_i S[i][j] * k[i]) * beta
                 float sum = 0.0f;
-                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
-                delta[j] = (v_d[j] - sum) * beta_val;
-            }
-
-            // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
-            for (int64_t j = 0; j < S_v; ++j) {
-                ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
-            }
-
-            // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)
-            for (int64_t j = 0; j < S_v; ++j) {
-                float sum = 0.0f;
-                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
+                ggml_vec_dot_f32(S_v, &sum, 0, row, 0, k_d, 0, 1);
+                const float d_j = (v_d[j] - sum) * beta_val;
+                // 外积更新: S[i][j] += k[i] * d_j
+                ggml_vec_mad_f32(S_v, row, k_d, d_j);
+                // attn_out[j] = sum_i S[i][j] * q[i]
+                sum = 0.0f;
+                ggml_vec_dot_f32(S_v, &sum, 0, row, 0, q_d, 0, 1);
                 attn_data[j] = sum * scale;
             }
 
