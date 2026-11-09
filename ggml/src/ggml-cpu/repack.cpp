@@ -5226,6 +5226,398 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
     }
 };
 
+#if defined(__AVX2__)
+// PTQ1_0 的 AVX2 重排（面向 Haswell 这类没有 VNNI 的 CPU）
+// 每 5 个块（640 个权重）重排为 128 字节纯 5-trit 打包：向量 v 第 i 字节的第 p 位 trit 对应权重 32*(5v+p)+i，
+// 于是同一个 32 字节向量连续乘 3 即可依次得到 5 段连续的 32 个权重，无需洗牌和 pmullw。
+// 字节预先异或 0x80，乘 3 后偏置保持不变 (384 = 128 mod 256)，可直接用有符号比较取 trit。
+// 行内布局: [G 组 x 128B][r 个尾块 x 32B（每字节 4 个 trit）][nb 个 fp16 缩放]，不超过原行大小。
+// 激活按每 128 个一组量化为 int8，附带 float 缩放和 int32 和（用于 t=w+1 的偏移校正）。
+class ptq1_0_avx2_traits : public tensor_traits_base {
+    static constexpr int QK = QK_PTQ1_0;  // 128
+    static constexpr int GB = 5;          // 每组块数
+
+  public:
+    // 尾块数 r 必须满足 3r <= G，才能放进原行大小
+    static bool fits(int64_t k) {
+        if (k % QK != 0 || k % 256 != 0) {
+            return false;
+        }
+        const int64_t nb = k / QK;
+        return 3 * (nb % GB) <= nb / GB;
+    }
+
+  private:
+    static size_t act_row_size(int64_t k) { return (size_t) k + 8 * (size_t) (k / QK); }
+
+    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
+        if (op->op != GGML_OP_MUL_MAT) {
+            return false;
+        }
+        const int64_t k = op->src[0]->ne[0];
+        size = act_row_size(k) * (size_t) (ggml_nrows(op->src[1])) + 64;
+        return true;
+    }
+
+    bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
+        if (op->op != GGML_OP_MUL_MAT) {
+            return false;
+        }
+        forward_mul_mat(params, op);
+        return true;
+    }
+
+    static inline float hsum_ps(__m256 v) {
+        __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        s = _mm_add_ss(s, _mm_movehdup_ps(s));
+        return _mm_cvtss_f32(s);
+    }
+
+    static inline int32_t hsum_epi32(__m256i v) {
+        __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+        s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+        s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+        return _mm_cvtsi128_si32(s);
+    }
+
+    // 一行激活: 每 128 个一组 int8 量化，输出 [q: k 字节][d: k/128 个 float][ds: k/128 个 float，等于 d * sum(q)]
+    static void quantize_act(const float * x, char * dst, int64_t k) {
+        const int64_t nb = k / QK;
+        int8_t * q  = (int8_t *) dst;
+        float *  d  = (float *) (dst + k);
+        float *  ds = (float *) (dst + k + 4 * nb);
+        const __m256  sign = _mm256_set1_ps(-0.0f);
+        const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        for (int64_t b = 0; b < nb; ++b) {
+            const float * xb = x + b * QK;
+            __m256 mx = _mm256_setzero_ps();
+            for (int i = 0; i < QK / 8; ++i) {
+                mx = _mm256_max_ps(mx, _mm256_andnot_ps(sign, _mm256_loadu_ps(xb + 8 * i)));
+            }
+            __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(mx), _mm256_extractf128_ps(mx, 1));
+            m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+            m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
+            const float amax = _mm_cvtss_f32(m4);
+            d[b] = amax / 127.0f;
+            const __m256 vid = _mm256_set1_ps(amax != 0.0f ? 127.0f / amax : 0.0f);
+            __m256i sum = _mm256_setzero_si256();
+            for (int i = 0; i < QK / 32; ++i) {
+                const float * xi = xb + 32 * i;
+                const __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xi +  0), vid));
+                const __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xi +  8), vid));
+                const __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xi + 16), vid));
+                const __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xi + 24), vid));
+                sum = _mm256_add_epi32(sum, _mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3)));
+                __m256i p = _mm256_packs_epi16(_mm256_packs_epi32(i0, i1), _mm256_packs_epi32(i2, i3));
+                p = _mm256_permutevar8x32_epi32(p, perm);
+                _mm256_storeu_si256((__m256i *) (q + b * QK + 32 * i), p);
+            }
+            ds[b] = d[b] * (float) hsum_epi32(sum);
+        }
+    }
+
+    // 一行权重与 NC 列激活的点积
+    template <int NC>
+    static void dot_row(int64_t k, const uint8_t * w, const char * const * act, float * out) {
+        const int64_t nb = k / QK;
+        const int64_t ng = nb / GB;
+        const int64_t nr = nb % GB;
+        const uint16_t * sc = (const uint16_t *) (w + 128 * ng + 32 * nr);
+
+        const int8_t * yq[NC];
+        const float *  yd[NC];
+        const float *  ys[NC];
+        for (int j = 0; j < NC; ++j) {
+            yq[j] = (const int8_t *) act[j];
+            yd[j] = (const float *) (act[j] + k);
+            ys[j] = (const float *) (act[j] + k + 4 * nb);
+        }
+
+        const __m256i c_lo = _mm256_set1_epi8(-43); // q >= 86  <=> (q^0x80) > -43
+        const __m256i c_hi = _mm256_set1_epi8(42);  // q >= 171 <=> (q^0x80) > 42
+        const __m256i one8 = _mm256_set1_epi8(1);
+        const __m256i ones = _mm256_set1_epi16(1);
+
+        __m256  acc[NC];
+        __m256i a16[NC];
+        alignas(32) float fb[NC][8];
+        for (int j = 0; j < NC; ++j) {
+            acc[j] = _mm256_setzero_ps();
+        }
+
+        // t = w + 1 = [q >= 86] + [q >= 171]
+        auto trit = [&](__m256i x) {
+            return _mm256_sub_epi8(_mm256_and_si256(_mm256_cmpgt_epi8(x, c_lo), one8), _mm256_cmpgt_epi8(x, c_hi));
+        };
+        // 屏障: 阻止编译器把连续的乘 3 合并为乘 9/27/81（AVX2 没有字节乘法，会展开成大量 port 0 指令）
+        auto mul3 = [](__m256i x) {
+            x = _mm256_add_epi8(x, _mm256_add_epi8(x, x));
+#if defined(__clang__) || defined(__GNUC__)
+            __asm__("" : "+x"(x));
+#endif
+            return x;
+        };
+
+        for (int64_t g = 0; g < ng; ++g) {
+            const uint8_t * q   = w + 128 * g;
+            const int64_t   off = 640 * g;
+            // 跨 4KB 页时硬件预取会中断，软件预取 2KB 之后的权重
+            _mm_prefetch((const char *) q + 2048, _MM_HINT_T0);
+            _mm_prefetch((const char *) q + 2048 + 64, _MM_HINT_T0);
+            // 本组 5 个 fp16 缩放（8 字节 + 1 个 half，避免越界读）
+            __m128i h = _mm_loadl_epi64((const __m128i *) (sc + 5 * g));
+            h = _mm_insert_epi16(h, sc[5 * g + 4], 4);
+            const __m256 dx = _mm256_cvtph_ps(h);
+            for (int j = 0; j < NC; ++j) {
+                _mm256_store_ps(fb[j], _mm256_mul_ps(dx, _mm256_loadu_ps(yd[j] + 5 * g)));
+            }
+#if defined(__clang__) || defined(__GNUC__)
+            if constexpr (NC > 1) {
+                // 让 fb 留在内存里，用纯加载广播；否则编译器会改成寄存器内 vpermps，增加寄存器压力和 port 5 负担
+                __asm__ volatile("" : : "r"(&fb[0][0]) : "memory");
+            }
+#endif
+            __m256i x = _mm256_setzero_si256();
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#endif
+            for (int c = 0; c < 20; ++c) {
+                x = (c % 5 == 0) ? _mm256_loadu_si256((const __m256i *) (q + 32 * (c / 5))) : mul3(x);
+                const __m256i t = trit(x);
+                for (int j = 0; j < NC; ++j) {
+                    const __m256i p = _mm256_maddubs_epi16(t, _mm256_loadu_si256((const __m256i *) (yq[j] + off + 32 * c)));
+                    a16[j] = (c % 4 == 0) ? p : _mm256_add_epi16(a16[j], p);
+                }
+                if (c % 4 == 3) {
+                    for (int j = 0; j < NC; ++j) {
+                        acc[j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(a16[j], ones)),
+                                                 _mm256_broadcast_ss(&fb[j][c / 4]), acc[j]);
+                    }
+                }
+            }
+        }
+
+        for (int64_t rb = 0; rb < nr; ++rb) {
+            const int64_t b   = GB * ng + rb;
+            const int64_t off = 640 * ng + 128 * rb;
+            const float   dx  = GGML_CPU_FP16_TO_FP32(sc[b]);
+            __m256i x = _mm256_loadu_si256((const __m256i *) (w + 128 * ng + 32 * rb));
+            for (int p = 0; p < 4; ++p) {
+                if (p > 0) {
+                    x = mul3(x);
+                }
+                const __m256i t = trit(x);
+                for (int j = 0; j < NC; ++j) {
+                    const __m256i pr = _mm256_maddubs_epi16(t, _mm256_loadu_si256((const __m256i *) (yq[j] + off + 32 * p)));
+                    a16[j] = (p == 0) ? pr : _mm256_add_epi16(a16[j], pr);
+                }
+            }
+            for (int j = 0; j < NC; ++j) {
+                acc[j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(a16[j], ones)), _mm256_set1_ps(dx * yd[j][b]), acc[j]);
+            }
+        }
+
+        // 偏移校正: sum_b dx_b * ds_b
+        __m256 cv[NC];
+        for (int j = 0; j < NC; ++j) {
+            cv[j] = _mm256_setzero_ps();
+        }
+        int64_t b = 0;
+        for (; b + 8 <= nb; b += 8) {
+            const __m256 dx = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (sc + b)));
+            for (int j = 0; j < NC; ++j) {
+                cv[j] = _mm256_fmadd_ps(dx, _mm256_loadu_ps(ys[j] + b), cv[j]);
+            }
+        }
+        for (int j = 0; j < NC; ++j) {
+            float s = hsum_ps(_mm256_sub_ps(acc[j], cv[j]));
+            for (int64_t bb = b; bb < nb; ++bb) {
+                s -= GGML_CPU_FP16_TO_FP32(sc[bb]) * ys[j][bb];
+            }
+            out[j] = s;
+        }
+    }
+
+    void forward_mul_mat(ggml_compute_params * params, ggml_tensor * op) {
+        const ggml_tensor * src0 = op->src[0];
+        const ggml_tensor * src1 = op->src[1];
+        ggml_tensor *       dst  = op;
+
+        GGML_TENSOR_BINARY_OP_LOCALS
+
+        const int ith = params->ith;
+        const int nth = params->nth;
+
+        GGML_ASSERT(ne02 == 1 && ne03 == 1);
+        GGML_ASSERT(nb0 == sizeof(float));
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(ne10 == ne00);
+
+        const int64_t k     = ne00;
+        const size_t  arow  = act_row_size(k);
+        const int64_t ncols = ne11 * ne12 * ne13;
+        char *        wdata = (char *) params->wdata;
+
+        for (int64_t c = ith; c < ncols; c += nth) {
+            const int64_t i13 = c / (ne11 * ne12);
+            const int64_t i12 = (c / ne11) % ne12;
+            const int64_t i11 = c % ne11;
+            quantize_act((const float *) ((const char *) src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13), wdata + c * arow, k);
+        }
+
+        // 行切块，动态分配给线程
+        const int64_t nr0      = ne01;
+        const int64_t chunk    = MAX(16, (nr0 + 8 * nth - 1) / (8 * nth));
+        const int64_t nchunk   = (nr0 + chunk - 1) / chunk;
+
+        if (ith == 0) {
+            ggml_threadpool_chunk_set(params->threadpool, nth);
+        }
+        ggml_barrier(params->threadpool);
+
+        auto dst_ptr = [&](int64_t c) {
+            const int64_t i13 = c / (ne11 * ne12);
+            const int64_t i12 = (c / ne11) % ne12;
+            const int64_t i11 = c % ne11;
+            return (char *) dst->data + i11 * nb1 + i12 * nb2 + i13 * nb3;
+        };
+
+        int current = ith;
+        while (current < nchunk) {
+            const int64_t r0 = current * chunk;
+            const int64_t r1 = MIN(r0 + chunk, nr0);
+
+            // 行再切成约 64KB 的小块，让权重在遍历所有列期间留在 L2
+            const int64_t rblk = ncols > 1 ? MAX(4, (int64_t) (64 * 1024) / (int64_t) nb01) : r1 - r0;
+            for (int64_t rb0 = r0; rb0 < r1; rb0 += rblk) {
+                const int64_t rb1 = MIN(rb0 + rblk, r1);
+                int64_t c = 0;
+                for (; c + 4 <= ncols; c += 4) {
+                    const char * act[4] = { wdata + (c + 0) * arow, wdata + (c + 1) * arow, wdata + (c + 2) * arow, wdata + (c + 3) * arow };
+                    char * dp[4] = { dst_ptr(c + 0), dst_ptr(c + 1), dst_ptr(c + 2), dst_ptr(c + 3) };
+                    for (int64_t r = rb0; r < rb1; ++r) {
+                        float res[4];
+                        dot_row<4>(k, (const uint8_t *) src0->data + r * nb01, act, res);
+                        for (int j = 0; j < 4; ++j) {
+                            ((float *) dp[j])[r] = res[j];
+                        }
+                    }
+                }
+                for (; c < ncols; ++c) {
+                    const char * act[1] = { wdata + c * arow };
+                    float * dp = (float *) dst_ptr(c);
+                    for (int64_t r = rb0; r < rb1; ++r) {
+                        dot_row<1>(k, (const uint8_t *) src0->data + r * nb01, act, dp + r);
+                    }
+                }
+            }
+
+            current = ggml_threadpool_chunk_add(params->threadpool, 1);
+        }
+    }
+
+    // 解出原始块的 128 个 trit (0..2)，顺序同 dequantize_row_ptq1_0
+    static void decode_block(const block_ptq1_0 & b, const uint8_t (*dec)[5], uint8_t * t) {
+        for (int n = 0; n < 5; ++n) {
+            for (int m = 0; m < 16; ++m) {
+                t[16 * n + m] = dec[b.qs[m]][n];
+            }
+        }
+        for (int n = 0; n < 5; ++n) {
+            for (int m = 0; m < 8; ++m) {
+                t[80 + 8 * n + m] = dec[b.qs[16 + m]][n];
+            }
+        }
+        for (int n = 0; n < 4; ++n) {
+            for (int h = 0; h < 2; ++h) {
+                t[120 + 2 * n + h] = dec[b.qh[h]][n];
+            }
+        }
+    }
+
+    int repack(struct ggml_tensor * t, const void * data, size_t data_size) override {
+        GGML_ASSERT(t->type == GGML_TYPE_PTQ1_0);
+        GGML_ASSERT(data_size == ggml_nbytes(t));
+
+        const int64_t k    = t->ne[0];
+        const int64_t nrow = ggml_nrows(t);
+        const int64_t nb   = k / QK;
+        const int64_t ng   = nb / GB;
+        const int64_t nr   = nb % GB;
+        const size_t  rs   = t->nb[1];
+        GGML_ASSERT(fits(k));
+        GGML_ASSERT(rs == nb * sizeof(block_ptq1_0));
+
+        // 解码表: 字节 -> 5 个 trit；编码表: 0..242 -> 字节（已异或 0x80）
+        struct tables {
+            uint8_t dec[256][5];
+            uint8_t enc[243];
+            tables() {
+                static const uint8_t pow3[5] = { 1, 3, 9, 27, 81 };
+                for (int v = 0; v < 256; ++v) {
+                    for (int n = 0; n < 5; ++n) {
+                        const uint8_t q = (uint8_t) (v * pow3[n]);
+                        dec[v][n] = (uint8_t) (((uint16_t) q * 3) >> 8);
+                    }
+                }
+                for (int v = 0; v < 243; ++v) {
+                    enc[v] = (uint8_t) (((v * 256 + 242) / 243) ^ 0x80);
+                }
+            }
+        };
+        static const tables tb;
+        const uint8_t (*dec)[5] = tb.dec;
+        const uint8_t * enc = tb.enc;
+
+        const char * src = (const char *) data;
+        char *       dst = (char *) t->data;
+
+#ifdef GGML_USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int64_t row = 0; row < nrow; ++row) {
+            const block_ptq1_0 * in  = (const block_ptq1_0 *) (src + row * rs);
+            uint8_t *            out = (uint8_t *) (dst + row * rs);
+            uint8_t              tr[GB * QK];
+            ggml_half *          sc = (ggml_half *) (out + 128 * ng + 32 * nr);
+
+            for (int64_t g = 0; g < ng; ++g) {
+                for (int bi = 0; bi < GB; ++bi) {
+                    decode_block(in[GB * g + bi], dec, tr + QK * bi);
+                    sc[GB * g + bi] = in[GB * g + bi].d;
+                }
+                for (int v = 0; v < 4; ++v) {
+                    for (int i = 0; i < 32; ++i) {
+                        int q = 0;
+                        for (int p = 0; p < 5; ++p) {
+                            q = q * 3 + tr[32 * (5 * v + p) + i];
+                        }
+                        out[128 * g + 32 * v + i] = enc[q];
+                    }
+                }
+            }
+            for (int64_t rb = 0; rb < nr; ++rb) {
+                const block_ptq1_0 & b = in[GB * ng + rb];
+                decode_block(b, dec, tr);
+                sc[GB * ng + rb] = b.d;
+                for (int i = 0; i < 32; ++i) {
+                    int q = 0;
+                    for (int p = 0; p < 4; ++p) {
+                        q = q * 3 + tr[32 * p + i];
+                    }
+                    out[128 * ng + 32 * rb + i] = enc[q * 3 + 1];
+                }
+            }
+            // 末尾空闲字节清零
+            const size_t used = 128 * ng + 32 * nr + 2 * nb;
+            memset(out + used, 0, rs - used);
+        }
+        return 0;
+    }
+};
+#endif // __AVX2__
+
 }  // namespace ggml::cpu::repack
 
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
@@ -5463,6 +5855,14 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
                 return &pq2_0_4x8_q8_0;
             }
         }
+    } else if (cur->type == GGML_TYPE_PTQ1_0) {
+#if defined(__AVX2__) && !defined(__AVX512VNNI__)
+        // 仅用于没有 VNNI 的 AVX2 机器，有 AVX-512 VNNI 时原 vec_dot 已足够快
+        static const ggml::cpu::repack::ptq1_0_avx2_traits ptq1_0_avx2;
+        if (ggml_n_dims(cur) == 2 && ggml::cpu::repack::ptq1_0_avx2_traits::fits(cur->ne[0])) {
+            return &ptq1_0_avx2;
+        }
+#endif
     }
 
     return nullptr;

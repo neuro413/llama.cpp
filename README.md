@@ -1,5 +1,64 @@
 # llama.cpp
 
+> [!NOTE]
+> **本分支 `prism-ptq1_0-avx2` 是 [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) 的 AVX2 优化分支**，
+> 基于上游 `prism` 分支的 [`d7b2896`](https://github.com/PrismML-Eng/llama.cpp/commit/d7b2896)，
+> 为 PTQ1_0 三值格式（如 Ternary-Bonsai-2-27B）新增了一个 CPU 重排内核，
+> 面向没有 AVX-512 VNNI 的 AVX2 处理器（Haswell 及之后的同类 CPU）。
+> 改动只涉及 `ggml/src/ggml-cpu/repack.cpp` 一个文件。
+
+## PTQ1_0 AVX2 重排内核
+
+### 效果
+
+测试模型 Ternary-Bonsai-2-27B-PTQ1_0（27B，权重约 6GB），4 核 AVX2（无 VNNI）CPU + 双通道 DDR3，纯 CPU 推理，4 线程：
+
+| 项目 | 上游 CPU 路径 | 本分支 |
+|---|---|---|
+| 生成速度 (tg) | 1.05 t/s | **2.87–2.91 t/s** |
+| 提示处理 (pp64) | 1.03 t/s | **6.73 t/s** |
+
+生成阶段已接近内存带宽上限。贪婪解码输出与上游路径逐字一致。
+
+### 原理
+
+加载时把 PTQ1_0 权重重排成适合 AVX2 的布局（不超过原始行大小）：
+
+```
+每行： [G 组 × 128 字节：纯 5-trit 打包，每字节已异或 0x80]
+      [r 个尾块 × 32 字节，每字节 4 个 trit]
+      [nb 个 fp16 缩放]
+      其中 nb = 每行 128 元素块数，G = nb / 5，r = nb % 5
+```
+
+- **解 trit**：同一个 32 字节向量连续乘 3（`x + x + x`），每次用两次有符号比较
+  `t = [x > -43] - [x > 42]` 取出最高位 trit（得到 w+1 ∈ {0,1,2}），不需要查表、洗牌或移位。
+  字节预先异或 0x80，乘 3 后偏置不变（384 ≡ 128 mod 256）。
+- **点积**：`vpmaddubsw(t, q)` 计算 `(w+1)·q`，多出的 `Σq` 偏移项在激活量化时预先算好（`ds = d·Σq`），每行最后统一向量化扣除。
+- **按组收尾**：每组 5 个块用一次 `vcvtph2ps` 转换 5 个缩放。
+- **多列共享解码**：提示处理时一次解码的权重同时与 4 列激活相乘；行再切成约 64KB 的小块，让权重在遍历所有列期间留在 L2。
+- **软件预取**：提前 2KB 预取，弥补硬件预取在 4KB 页边界处中断的问题。
+- **编译器屏障**：LLVM 会把连续的 `x*3` 合并成乘 9/27/81，而 AVX2 没有字节乘法，会展开成大量只能走 port 0 的指令，因此每次乘 3 后加 `__asm__("" : "+x"(x))`。
+
+启用条件：编译目标有 AVX2 且没有 AVX-512 VNNI，张量为 2D 的 PTQ1_0，且行内尾块能放进原行大小。
+使用 `GGML_CPU_ALL_VARIANTS` 构建时，`haswell` 等对应变体会自动启用。
+
+### 推荐运行参数
+
+```bash
+# OpenMP 构建时，-C/--cpu-strict 对 OpenMP 线程池无效，要用环境变量把线程分散到各物理核
+export OMP_PLACES=cores OMP_PROC_BIND=spread
+llama-server -m Ternary-Bonsai-2-27B-PTQ1_0.gguf --mmproj Ternary-Bonsai-2-27B-mmproj-BF16.gguf \
+  -t <物理核数> -lm dio -fa on -ctk q8_0 -ctv q8_0 -np 1 -cram 512
+```
+
+- **绑核**：Windows 等系统可能把两个计算线程放到同一物理核的两个超线程上，它们共用同一组执行端口，
+  矩阵乘法会被最慢的核拖住。绑核后生成速度约提升 25%。线程数取物理核数，开超线程反而更慢。
+- **`-lm dio`**：DirectIO 加载，系统不保留文件缓存，避免文件缓存和重排后的内存各占一份。
+- **`-cram 512`**：llama-server 默认用 8GB 内存做提示缓存，内存较小的机器建议调低。
+
+---
+
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
 >
